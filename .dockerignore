@@ -1,5 +1,12 @@
-.venv
-__pycache__
-*.sqlite3
+.git
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
+venv/
+.venv/
+dist/
+build/
+*.sqlite3
+
