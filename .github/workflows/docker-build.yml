@@ -19,7 +19,7 @@ jobs:
       - name: Build and push (root context)
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./hospital-api
           push: true
           tags: udiecynthia/hospital-api:latest
           cache-from: type=gha
