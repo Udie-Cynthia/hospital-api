@@ -13,13 +13,14 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: udiecynthia
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push (root context)
         uses: docker/build-push-action@v6
         with:
-          context: ./hospital-api
+          context: .
+          file: ./Dockerfile
           push: true
           tags: udiecynthia/hospital-api:latest
           cache-from: type=gha
