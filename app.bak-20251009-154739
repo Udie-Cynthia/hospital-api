@@ -1,0 +1,406 @@
+import os, io, uuid
+from functools import wraps
+from flask import Flask, jsonify, request, Response, redirect
+from PIL import Image
+import boto3
+from dotenv import load_dotenv
+
+from db import Base, engine, SessionLocal
+from models import Patient, Doctor, Appointment
+
+load_dotenv()
+
+# ---- Admin auth: header "Authorization: Bearer <token>" or ?token=... ----
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+def _extract_token():
+    t = request.headers.get("Authorization", "")
+    if t.startswith("Bearer "):
+        t = t[7:].strip()
+    if not t:
+        t = request.args.get("token", "")
+    return t
+
+def require_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = _extract_token()
+        if not ADMIN_TOKEN:
+            return jsonify({"error":"admin token not configured"}), 500
+        if token != ADMIN_TOKEN:
+            return jsonify({"error":"unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+# ---- App setup ----
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB
+Base.metadata.create_all(bind=engine)
+
+AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
+S3_BUCKET = os.getenv("S3_BUCKET")
+PHOTO_URL_TTL = int(os.getenv("PHOTO_URL_TTL_SECONDS", "604800"))
+PORT = int(os.getenv("PORT", "8000"))
+
+s3 = boto3.client("s3", region_name=AWS_REGION)
+ALLOWED = {"png", "jpg", "jpeg", "webp"}
+
+def presigned_get(key: str):
+    if not key: return None
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PHOTO_URL_TTL
+    )
+
+def save_photo_to_s3(file_storage, prefix: str, entity_id: int) -> str:
+    raw = file_storage.read()
+    if not raw: raise ValueError("Empty file")
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img.thumbnail((1024, 1024))
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90, optimize=True)
+    out.seek(0)
+    key = f"{prefix}/{entity_id}/photo-{uuid.uuid4().hex}.jpg"
+    s3.put_object(
+        Bucket=S3_BUCKET, Key=key, Body=out,
+        ContentType="image/jpeg", CacheControl="max-age=31536000, public"
+    )
+    return key
+
+@app.get("/health")
+def health():
+    return jsonify({"status":"ok"}), 200
+
+@app.get("/me")
+def me():
+    token = _extract_token()
+    return jsonify({"is_admin": bool(ADMIN_TOKEN and token == ADMIN_TOKEN)})
+
+# ---- Patients ----
+@app.get("/patients")
+def patients_list():
+    with SessionLocal() as db:
+        items = db.query(Patient).all()
+        return jsonify([{
+            "id": p.id, "full_name": p.full_name, "phone": p.phone,
+            "photo_url": presigned_get(p.photo_key)
+        } for p in items])
+
+@app.post("/patients")
+@require_admin
+def patients_create():
+    data = request.get_json(force=True)
+    with SessionLocal() as db:
+        p = Patient(full_name=data["full_name"], phone=data.get("phone"))
+        db.add(p); db.commit(); db.refresh(p)
+        return jsonify({"id": p.id, "full_name": p.full_name, "phone": p.phone}), 201
+
+@app.post("/patients/photo")
+@require_admin
+def patients_photo():
+    patient_id = request.form.get("id")
+    file = request.files.get("file")
+    if not patient_id or not file:
+        return jsonify({"error":"id and file required"}), 400
+    ext = file.filename.rsplit(".",1)[-1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED:
+        return jsonify({"error":"allowed: jpg,jpeg,png,webp"}), 400
+    with SessionLocal() as db:
+        p = db.get(Patient, int(patient_id))
+        if not p: return jsonify({"error":"Patient not found"}), 404
+        key = save_photo_to_s3(file, "patients", p.id)
+        p.photo_key = key; db.commit()
+        return jsonify({"id": p.id, "photo_url": presigned_get(key)}), 201
+
+# ---- Doctors ----
+@app.get("/doctors")
+def doctors_list():
+    with SessionLocal() as db:
+        items = db.query(Doctor).all()
+        return jsonify([{
+            "id": d.id, "full_name": d.full_name, "specialty": d.specialty,
+            "photo_url": presigned_get(d.photo_key)
+        } for d in items])
+
+@app.post("/doctors")
+@require_admin
+def doctors_create():
+    data = request.get_json(force=True)
+    with SessionLocal() as db:
+        d = Doctor(full_name=data["full_name"], specialty=data.get("specialty"))
+        db.add(d); db.commit(); db.refresh(d)
+        return jsonify({"id": d.id, "full_name": d.full_name, "specialty": d.specialty}), 201
+
+@app.post("/doctors/photo")
+@require_admin
+def doctors_photo():
+    doctor_id = request.form.get("id")
+    file = request.files.get("file")
+    if not doctor_id or not file:
+        return jsonify({"error":"id and file required"}), 400
+    ext = file.filename.rsplit(".",1)[-1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED:
+        return jsonify({"error":"allowed: jpg,jpeg,png,webp"}), 400
+    with SessionLocal() as db:
+        d = db.get(Doctor, int(doctor_id))
+        if not d: return jsonify({"error":"Doctor not found"}), 404
+        key = save_photo_to_s3(file, "doctors", d.id)
+        d.photo_key = key; db.commit()
+        return jsonify({"id": d.id, "photo_url": presigned_get(key)}), 201
+
+# ---- Appointments ----
+@app.get("/appointments")
+def appt_list():
+    with SessionLocal() as db:
+        appts = db.query(Appointment).all()
+        return jsonify([{
+            "id": a.id, "patient_id": a.patient_id, "doctor_id": a.doctor_id,
+            "date_time": a.date_time.isoformat(), "reason": a.reason
+        } for a in appts])
+
+@app.post("/appointments")
+@require_admin
+def appt_create():
+    data = request.get_json(force=True)
+    with SessionLocal() as db:
+        a = Appointment(patient_id=data["patient_id"], doctor_id=data.get("doctor_id"), reason=data.get("reason"))
+        db.add(a); db.commit(); db.refresh(a)
+        return jsonify({
+            "id": a.id, "patient_id": a.patient_id, "doctor_id": a.doctor_id,
+            "date_time": a.date_time.isoformat(), "reason": a.reason
+        }), 201
+
+# ---- Minimal homepage ----
+@app.get("/")
+def root():
+    return redirect("/health", code=302)
+
+
+# ---- Public Homepage: Cynthia Health Institute ----
+@app.get("/site")
+def site():
+    html = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Cynthia Health Institute</title>
+  <style>
+    :root{--bg:#0f172a;--muted:#94a3b8;--accent:#22d3ee;--text:#e5e7eb}
+    *{box-sizing:border-box}
+    body{margin:0;background:#0b1022;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial}
+    a{color:var(--accent);text-decoration:none}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px}
+    .nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+    .brand{font-weight:800;font-size:20px;letter-spacing:.3px}
+    .nav a{margin-left:16px;color:var(--muted)}
+    .hero{display:grid;grid-template-columns:1.2fr .8fr;gap:28px;align-items:center;padding:36px 0}
+    .hero h1{margin:0;font-size:42px;line-height:1.1}
+    .hero p{color:var(--muted);margin:12px 0 18px}
+    .cta{display:inline-block;background:var(--accent);color:#001016;font-weight:700;border-radius:12px;padding:12px 18px}
+    .card{background:linear-gradient(180deg,#0e162b,#0a1122);border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden}
+    .pad{padding:16px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+    .section-title{font-weight:800;font-size:18px;margin:26px 0 12px}
+    .muted{color:var(--muted)}
+    .img{width:100%;height:160px;object-fit:cover;background:#0d1630}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .founder{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:center}
+    .founder img{width:100%;height:280px;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,.07)}
+    @media (max-width:930px){.hero,.founder,.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <div class="nav">
+      <div class="brand">Cynthia Health Institute</div>
+      <div>
+        <a href="#services">Services</a>
+        <a href="#about">About</a>
+        <a href="#testimonials">Testimonials</a>
+        <a id="loginlink" href="/login">Login</a>
+        <a id="adminlink" href="/console" style="display:none">Admin Console</a>
+      </div>
+    </div>
+
+    <section class="hero card">
+      <div class="pad">
+        <div style="display:inline-block;border:1px solid rgba(255,255,255,.14);padding:6px 10px;border-radius:999px;color:#94a3b8;font-size:12px">
+          Project by Cynthia Udie
+        </div>
+        <h1>World-class care, delivered with heart.</h1>
+        <p>Cynthia Health Institute blends compassionate clinicians with evidence-based medicine, modern diagnostics, and a seamless patient experience.
+           <strong>This project was created and built by Cynthia Udie.</strong>
+        </p>
+        <a class="cta" href="#services">Explore Our Services</a>
+      </div>
+      <div>
+        <img class="img" src="https://images.unsplash.com/photo-1580281657527-47d4d1e4a7a5?q=80&w=1200&auto=format&fit=crop" alt="">
+      </div>
+    </section>
+
+    <section class="card founder" id="founder" style="margin-top:20px;">
+      <div class="pad">
+        <div class="section-title">Meet the Founder – Cynthia Udie</div>
+        <p class="muted">
+          Cynthia created and built this project to demonstrate how modern hospitals can pair clinical excellence
+          with intuitive digital experiences—prioritizing safety, respect, timely care, and clear communication.
+        </p>
+        <p class="muted">Below is Cynthia’s photo in a doctor’s coat (pulled from the Doctors directory if available).</p>
+      </div>
+      <div id="founder-photo-box" class="pad">
+        <div class="card" style="border-style:dashed;text-align:center;padding:16px;">
+          <div class="muted">Founder photo will appear here when added to “Doctors”.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="about" class="row" style="margin-top:20px;">
+      <div class="card"><div class="pad">
+        <div class="section-title">About Cynthia Udie</div>
+        <p class="muted">Cynthia Udie created and built this project to model a hospital that blends clinical excellence with a delightful,
+           transparent digital journey. The vision: safe, respectful, and timely care—supported by smart technology and a culture of continuous improvement.</p>
+      </div></div>
+      <div class="card"><div class="pad">
+        <div class="section-title">Vision</div>
+        <ul class="muted" style="margin-top:0;line-height:1.6">
+          <li>Evidence-based care and modern diagnostics</li>
+          <li>Seamless patient onboarding and follow-up</li>
+          <li>Clear communication and compassionate clinicians</li>
+          <li>Continuous quality improvement</li>
+        </ul>
+      </div></div>
+    </section>
+
+    <section id="services">
+      <div class="section-title">Services</div>
+      <div class="grid">
+        <div class="card"><div class="pad"><strong>Primary & Family Medicine</strong><div class="muted">Preventive care, annual checkups, and chronic condition management for all ages.</div></div></div>
+        <div class="card"><div class="pad"><strong>Cardiology</strong><div class="muted">Heart health assessments, ECG/Echo diagnostics, and personalized treatment plans.</div></div></div>
+        <div class="card"><div class="pad"><strong>Obstetrics & Gynecology</strong><div class="muted">Women’s health, prenatal care, and family planning in a supportive setting.</div></div></div>
+        <div class="card"><div class="pad"><strong>Pediatrics</strong><div class="muted">Well-child visits, immunizations, and same-day sick care with a family-first approach.</div></div></div>
+        <div class="card"><div class="pad"><strong>Diagnostics & Imaging</strong><div class="muted">On-site lab services and imaging for faster, more accurate results.</div></div></div>
+        <div class="card"><div class="pad"><strong>Telehealth & e-Consults</strong><div class="muted">Secure virtual visits for follow-ups and routine consultations.</div></div></div>
+      </div>
+    </section>
+
+    <section style="margin-top:22px;">
+      <div class="section-title">Doctors</div>
+      <div class="grid" id="doctors"></div>
+      <div class="section-title" style="margin-top:22px;">Patients</div>
+      <div class="grid" id="patients"></div>
+    </section>
+
+    <section id="testimonials">
+      <div class="section-title">Testimonials (Demo/Mock)</div>
+      <div class="grid">
+        <div class="card"><div class="pad"><div><strong>Fortune</strong></div><div class="muted">“From booking to follow-up, everything felt coordinated and caring. I felt heard.” (demo)</div></div></div>
+        <div class="card"><div class="pad"><div><strong>Ose</strong></div><div class="muted">“The doctors explained my options clearly and the staff were incredibly professional.” (demo)</div></div></div>
+        <div class="card"><div class="pad"><div><strong>Tabi</strong></div><div class="muted">“Fast diagnostics, clear results, and compassionate care—highly recommended.” (demo)</div></div></div>
+      </div>
+    </section>
+
+    <footer id="contact" style="margin-top:24px;">
+      <div class="section-title">Contact</div>
+      <div class="card"><div class="pad">
+        <div>Phone: <a href="tel:+2348154986548">+234 815 498 6548</a></div>
+        <div>Email: <a href="mailto:udiecynthia@gmail.com">udiecynthia@gmail.com</a></div>
+        <div>LinkedIn: <a target="_blank" rel="noopener" href="https://www.linkedin.com/in/cynthia-udie-68936135b?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app">linkedin.com/in/cynthia-udie-68936135b</a></div>
+        <div style="margin-top:8px;color:#94a3b8">© 2025 Cynthia Health Institute. All rights reserved.</div>
+      </div></div>
+    </footer>
+
+  </div>
+
+  <script>
+    async function status(){
+      try {
+        const m = await fetch('/me').then(r=>r.json());
+        if(m.is_admin){
+          document.getElementById('adminlink').style.display='inline-block';
+          const el = document.getElementById('loginlink'); if(el) el.style.display='none';
+        }
+      } catch(e) {}
+    }
+    function renderCards(list){
+      return list.map(function(x){
+        var photo = x.photo_url ? '<img class="img" src="'+x.photo_url+'" alt="">' : '<div class="img"></div>';
+        var line2 = x.specialty || x.phone || '';
+        return '<div class="card">'+photo+'<div class="pad"><div style="font-weight:700;margin-bottom:4px;">'+(x.full_name||'')+'</div><div class="muted">'+line2+'</div></div></div>';
+      }).join('');
+    }
+    function pickFounderPhoto(doctors){
+      var box = document.getElementById('founder-photo-box');
+      if(!box) return;
+      var found = null;
+      for (var i=0;i<doctors.length;i++){
+        var n = (doctors[i].full_name||'').toLowerCase();
+        if(n.includes('cynthia') || n.includes('udie')) { found = doctors[i]; break; }
+      }
+      if(!found){
+        for (var j=0;j<doctors.length;j++){ if(doctors[j].photo_url){ found = doctors[j]; break; } }
+      }
+      if(found && found.photo_url){
+        box.innerHTML = '<img src="'+found.photo_url+'" alt="Founder photo" />';
+      }
+    }
+    async function loadDirectory(){
+      try {
+        const dr = await fetch('/doctors').then(r=>r.json());
+        const pt = await fetch('/patients').then(r=>r.json());
+        document.getElementById('doctors').innerHTML = renderCards(dr);
+        document.getElementById('patients').innerHTML = renderCards(pt);
+        pickFounderPhoto(dr);
+      } catch(e) {}
+    }
+    status(); loadDirectory();
+  </script>
+</body>
+</html>
+    """
+    return Response(html, mimetype="text/html")
+
+# ---- Simple Login Page (static) ----
+@app.get("/login")
+def login_page():
+    html = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Cynthia Health Institute – Staff Login</title>
+  <style>
+    body{margin:0;background:#0b1022;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto}
+    .wrap{max-width:420px;margin:8vh auto;background:#0e162b;border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden}
+    .pad{padding:20px}
+    input{width:100%;padding:12px 14px;margin:8px 0;background:#0b1227;border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#e5e7eb}
+    .btn{width:100%;padding:12px 14px;margin-top:10px;border-radius:10px;background:#22d3ee;color:#031519;font-weight:800;border:0}
+    .muted{color:#94a3b8}
+    a{color:#22d3ee;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="pad">
+      <h2 style="margin:0 0 6px;">Cynthia Health Institute</h2>
+      <div class="muted" style="margin-bottom:14px;">Authorized access for staff and administrators</div>
+      <label>Email/Username</label>
+      <input placeholder="you@example.com" />
+      <label>Password</label>
+      <input type="password" placeholder="••••••••" />
+      <button class="btn">Sign In</button>
+      <div style="margin-top:10px;"><a href="#">Forgot password?</a></div>
+      <div class="muted" style="margin-top:16px;font-size:13px;">
+        Phone: +234 815 498 6548 • Email: <a href="mailto:udiecynthia@gmail.com">udiecynthia@gmail.com</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    """
+    return Response(html, mimetype="text/html")
+

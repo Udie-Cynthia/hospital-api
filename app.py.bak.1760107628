@@ -1,0 +1,400 @@
+import os, io, uuid
+from functools import wraps
+from datetime import datetime
+from flask import Flask, jsonify, request, Response, redirect, render_template_string
+from PIL import Image
+import boto3
+from dotenv import load_dotenv
+
+from db import Base, engine, SessionLocal
+from models import Patient, Doctor, Appointment
+
+load_dotenv()
+
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
+AWS_REGION    = os.getenv("AWS_REGION", "eu-north-1")
+S3_BUCKET     = os.getenv("S3_BUCKET")
+PHOTO_URL_TTL = int(os.getenv("PHOTO_URL_TTL_SECONDS", "604800"))
+PORT          = int(os.getenv("PORT", "8000"))
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+Base.metadata.create_all(bind=engine)
+
+s3 = boto3.client("s3", region_name=AWS_REGION)
+ALLOWED = {"png", "jpg", "jpeg", "webp"}
+
+def presigned_get(key: str):
+    if not key: return None
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=PHOTO_URL_TTL
+    )
+
+def require_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.args.get("token") or request.headers.get("Authorization","")
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        if not ADMIN_TOKEN:
+            return jsonify({"error":"admin token not configured"}), 500
+        if token != ADMIN_TOKEN:
+            return jsonify({"error":"unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+@app.get("/health")
+def health():
+    return jsonify({"status":"ok"})
+
+# ----- API: Patients / Doctors (public read) -----
+@app.get("/patients")
+def patients_list():
+    with SessionLocal() as db:
+        items = db.query(Patient).all()
+        return jsonify([{
+            "id": p.id,
+            "full_name": p.full_name,
+            "phone": p.phone,
+            "photo_url": presigned_get(p.photo_key)
+        } for p in items])
+
+@app.post("/patients")
+@require_admin
+def patients_create():
+    data = request.get_json(force=True)
+    with SessionLocal() as db:
+        p = Patient(full_name=data["full_name"], phone=data.get("phone"))
+        db.add(p); db.commit(); db.refresh(p)
+        return jsonify({"id":p.id,"full_name":p.full_name,"phone":p.phone}), 201
+
+@app.post("/patients/photo")
+@require_admin
+def patients_photo():
+    pid  = request.form.get("id")
+    file = request.files.get("file")
+    if not pid or not file: return jsonify({"error":"id and file required"}), 400
+    ext = file.filename.rsplit(".",1)[-1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED: return jsonify({"error":"allowed: jpg,jpeg,png,webp"}), 400
+    raw = file.read()
+    if not raw: return jsonify({"error":"empty file"}), 400
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img.thumbnail((1024,1024))
+    out = io.BytesIO(); img.save(out, format="JPEG", quality=90, optimize=True); out.seek(0)
+    key = f"patients/{int(pid)}/photo-{uuid.uuid4().hex}.jpg"
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=out, ContentType="image/jpeg", CacheControl="max-age=31536000, public")
+    with SessionLocal() as db:
+        p = db.get(Patient, int(pid))
+        if not p: return jsonify({"error":"Patient not found"}), 404
+        p.photo_key = key; db.commit()
+        return jsonify({"id":p.id,"photo_url":presigned_get(key)}), 201
+
+@app.get("/doctors")
+def doctors_list():
+    with SessionLocal() as db:
+        items = db.query(Doctor).all()
+        return jsonify([{
+            "id": d.id,
+            "full_name": d.full_name,
+            "specialty": d.specialty,
+            "photo_url": presigned_get(d.photo_key)
+        } for d in items])
+
+@app.post("/doctors")
+@require_admin
+def doctors_create():
+    data = request.get_json(force=True)
+    with SessionLocal() as db:
+        d = Doctor(full_name=data["full_name"], specialty=data.get("specialty"))
+        db.add(d); db.commit(); db.refresh(d)
+        return jsonify({"id":d.id,"full_name":d.full_name,"specialty":d.specialty}), 201
+
+@app.post("/doctors/photo")
+@require_admin
+def doctors_photo():
+    did  = request.form.get("id")
+    file = request.files.get("file")
+    if not did or not file: return jsonify({"error":"id and file required"}), 400
+    ext = file.filename.rsplit(".",1)[-1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED: return jsonify({"error":"allowed: jpg,jpeg,png,webp"}), 400
+    raw = file.read()
+    if not raw: return jsonify({"error":"empty file"}), 400
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img.thumbnail((1024,1024))
+    out = io.BytesIO(); img.save(out, format="JPEG", quality=90, optimize=True); out.seek(0)
+    key = f"doctors/{int(did)}/photo-{uuid.uuid4().hex}.jpg"
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=out, ContentType="image/jpeg", CacheControl="max-age=31536000, public")
+    with SessionLocal() as db:
+        d = db.get(Doctor, int(did))
+        if not d: return jsonify({"error":"Doctor not found"}), 404
+        d.photo_key = key; db.commit()
+        return jsonify({"id":d.id,"photo_url":presigned_get(key)}), 201
+
+# ----- Simple protected console (pass ?token=...) -----
+@app.get("/console")
+@require_admin
+def console():
+    html = """
+    <html><body style="font-family: system-ui; max-width: 900px; margin:2rem auto;">
+      <h2>Hospital Console</h2>
+      <h3>Create Patient</h3>
+      <form onsubmit="createPatient(event)">
+        <input placeholder="Full name" id="pname"/> <input placeholder="Phone" id="pphone"/>
+        <button>Create</button>
+      </form>
+      <h3>Upload Patient Photo</h3>
+      <form id="pf" method="post" enctype="multipart/form-data" action="/patients/photo">
+        <input name="id" placeholder="Patient ID" required />
+        <input type="file" name="file" accept=".jpg,.jpeg,.png,.webp" required />
+        <button>Upload</button>
+      </form>
+      <h3>Create Doctor</h3>
+      <form onsubmit="createDoctor(event)">
+        <input placeholder="Full name" id="dname"/> <input placeholder="Specialty" id="dspec"/>
+        <button>Create</button>
+      </form>
+      <h3>Upload Doctor Photo</h3>
+      <form id="df" method="post" enctype="multipart/form-data" action="/doctors/photo">
+        <input name="id" placeholder="Doctor ID" required />
+        <input type="file" name="file" accept=".jpg,.jpeg,.png,.webp" required />
+        <button>Upload</button>
+      </form>
+      <h3>Current People</h3>
+      <button onclick="loadAll()">Refresh</button>
+      <div id="out"></div>
+      <script>
+        const token = new URLSearchParams(location.search).get('token') || '';
+        async function createPatient(e){e.preventDefault();
+          const r = await fetch('/patients',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+            body: JSON.stringify({full_name: document.getElementById('pname').value, phone: document.getElementById('pphone').value})});
+          alert(await r.text());
+        }
+        async function createDoctor(e){e.preventDefault();
+          const r = await fetch('/doctors',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+            body: JSON.stringify({full_name: document.getElementById('dname').value, specialty: document.getElementById('dspec').value})});
+          alert(await r.text());
+        }
+        async function loadAll(){
+          const [p,d] = await Promise.all([fetch('/patients'), fetch('/doctors')]);
+          const patients = await p.json(), doctors = await d.json();
+          const h = (list,title)=> '<h4>'+title+'</h4><div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(180px,1fr));gap:10px;">' +
+            list.map(x=>'<div style="border:1px solid #ddd;border-radius:12px;padding:10px">'+
+              (x.photo_url?'<img src="'+x.photo_url+'" style="width:100%;height:160px;object-fit:cover;border-radius:8px;"/>' : '<div style="height:160px;background:#f4f4f4;border-radius:8px;display:grid;place-items:center;color:#888">No photo</div>')+
+              '<div style="margin-top:6px;font-weight:600">'+(x.full_name||'')+'</div>' +
+              '<div style="color:#555">'+(x.specialty||x.phone||'')+'</div>' +
+            '</div>').join('') + '</div>';
+          document.getElementById('out').innerHTML = h(patients,'Patients') + h(doctors,'Doctors');
+        }
+      </script>
+    </body></html>
+    """
+    return Response(html, mimetype="text/html")
+
+# ----- Simple polished homepage (server-rendered) -----
+SITE_TPL = r"""<!doctype html>
+<html><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{{ hospital }}</title>
+<style>
+:root { --bg:#0b1022; --fg:#e5e7eb; --muted:#94a3b8; --card:#111633; --accent:#22d3ee; --line:#1f294a; }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:24px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.brand{font-size:22px;font-weight:800;letter-spacing:0.2px}
+.nav a{color:var(--fg);opacity:.9;text-decoration:none;margin-left:16px}
+.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:22px;align-items:center;padding:24px 0;border-bottom:1px solid var(--line)}
+.tag{font-size:38px;font-weight:900;line-height:1.1;margin:0 0 10px}
+.sub{color:var(--muted);margin-top:8px}
+.cta{display:inline-block;margin-top:14px;background:var(--accent);color:#031519;font-weight:800;border-radius:10px;padding:10px 16px;text-decoration:none}
+.section-title{font-weight:900;margin:26px 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(220px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.img{width:100%;height:150px;object-fit:cover;background:#0c1430}
+.pad{padding:14px}
+.name{font-weight:800}
+.muted{color:var(--muted)}
+.founder{display:grid;grid-template-columns:.8fr 1.2fr;gap:18px;align-items:center;border:1px solid var(--line);background:var(--card);border-radius:16px;overflow:hidden}
+.founder .ph{height:240px;background:#0c1430;display:grid;place-items:center;color:var(--muted)}
+.contact a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="header">
+      <div class="brand">{{ hospital }}</div>
+      <nav class="nav">
+        <a href="#about">About</a><a href="#services">Services</a><a href="#directory">Directory</a><a href="#testimonials">Testimonials</a><a id="loginlink" href="/login">Login</a><a id="adminlink" href="/console">Admin</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <div>
+        <h1 class="tag">World-class care, delivered with heart.</h1>
+        <div class="sub">We blend compassionate clinicians with evidence-based medicine, modern diagnostics, and a seamless patient experience. This project was created and built by {{ founder }}.</div>
+        <a class="cta" href="#services">Explore Our Services</a>
+      </div>
+      <div class="founder">
+        <div id="founder-photo-box" class="ph">Founder photo</div>
+        <div class="pad">
+          <div class="section-title" id="about">Meet {{ founder }}, Founder of {{ hospital }}</div>
+          <div class="muted"> {{ founder }} created and built this project to demonstrate how modern hospitals pair clinical excellence with intuitive digital experiences. Our vision: safe, respectful, and timely care—supported by clear communication, smart technology, and continuous improvement.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="services">
+      <div class="section-title">Services</div>
+      <div class="grid">
+        <div class="card"><div class="pad"><div class="name">Primary & Family Medicine</div><div class="muted">Preventive care, annual checkups, and chronic condition management for all ages.</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Cardiology</div><div class="muted">Heart assessments, ECG/Echo diagnostics, and personalized plans.</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Obstetrics & Gynecology</div><div class="muted">Women’s health, prenatal care, and family planning in a supportive setting.</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Pediatrics</div><div class="muted">Well-child visits, immunizations, and same-day sick care.</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Diagnostics & Imaging</div><div class="muted">On-site lab services and imaging for faster, accurate results.</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Telehealth & e-Consults</div><div class="muted">Secure virtual visits for follow-ups and routine consultations.</div></div></div>
+      </div>
+    </section>
+
+    <section id="directory">
+      <div class="section-title">Team & Patients</div>
+      <div class="section-title" style="margin-top:10px;">Doctors</div>
+      <div class="grid" id="doctors"></div>
+      <div class="section-title" style="margin-top:22px;">Patients</div>
+      <div class="grid" id="patients"></div>
+    </section>
+
+    <section id="testimonials">
+      <div class="section-title">Testimonials (Demo/Mock)</div>
+      <div class="grid">
+        <div class="card"><div class="pad"><div class="name">Fortune</div><div class="muted">“From booking to follow-up, everything felt coordinated and caring. I felt heard.” (demo)</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Ose</div><div class="muted">“The doctors explained my options clearly and the staff were incredibly professional.” (demo)</div></div></div>
+        <div class="card"><div class="pad"><div class="name">Tabi</div><div class="muted">“Fast diagnostics, clear results, and compassionate care—highly recommended.” (demo)</div></div></div>
+      </div>
+    </section>
+
+    <footer id="contact" style="margin:30px 0">
+      <div class="section-title">Contact</div>
+      <div class="muted contact">
+        <div>Phone: <a href="tel:+2348154986548">+234 815 498 6548</a></div>
+        <div>Email: <a href="mailto:udiecynthia@gmail.com">udiecynthia@gmail.com</a></div>
+        <div>LinkedIn: <a target="_blank" rel="noopener" href="https://www.linkedin.com/in/cynthia-udie-68936135b?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app">linkedin.com/in/cynthia-udie-68936135b</a></div>
+        <div style="margin-top:8px;">© {{ year }} {{ hospital }}. All rights reserved.</div>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    function renderCards(list){
+      return list.map(x=>`
+        <div class="card">
+          ${x.photo_url ? `<img class="img" src="${x.photo_url}" alt="">` : `<div class="img"></div>`}
+          <div class="pad">
+            <div class="name">${x.full_name||''}</div>
+            <div class="muted">${x.specialty || x.phone || ''}</div>
+          </div>
+        </div>`).join('');
+    }
+    function pickFounderPhoto(doctors){
+      const founder = "{{ founder }}".toLowerCase();
+      const match = doctors.find(d => (d.full_name||'').toLowerCase().includes('cynthia')) || doctors.find(d=>d.photo_url);
+      if(match && match.photo_url){
+        const box = document.getElementById('founder-photo-box');
+        box.innerHTML = `<img src="${match.photo_url}" alt="Founder photo" style="width:100%;height:100%;object-fit:cover">`;
+      }
+    }
+    async function loadDirectory(){
+      const [dr, pt] = await Promise.all([ fetch('/doctors').then(r=>r.json()), fetch('/patients').then(r=>r.json()) ]);
+      document.getElementById('doctors').innerHTML = renderCards(dr);
+      document.getElementById('patients').innerHTML = renderCards(pt);
+      pickFounderPhoto(dr);
+    }
+    loadDirectory();
+  </script>
+</body></html>
+"""
+
+@app.get("/site")
+def site():
+    hospital = "Cynthia Health Institute"
+    founder  = "Cynthia Udie"
+    return render_template_string(SITE_TPL, hospital=hospital, founder=founder, year=datetime.utcnow().year)
+
+@app.get("/")
+def root():
+    return redirect("/site", code=302)
+# paste ONLY Python between these lines
+# (for example, the SITE_TEMPLATE block or the /site route)
+
+# ====== LOGIN + COOKIE AUTH BRIDGE (append) ======
+from flask import make_response, redirect
+
+# Bridge: if no Authorization header, copy token from cookie or ?token=
+@app.before_request
+def _auth_cookie_bridge():
+    if not request.headers.get('Authorization'):
+        t = request.cookies.get('auth') or request.args.get('token')
+        if t:
+            # make it look like a real Authorization header to the app
+            request.environ['HTTP_AUTHORIZATION'] = f'Bearer {t}'
+
+# Simple login page (GET)
+LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Staff Login – Cynthia Health Institute</title>
+<style>
+  body{margin:0;background:#0b1022;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif}
+  .wrap{max-width:420px;margin:8vh auto;padding:24px}
+  .card{background:#111633;border:1px solid #1f294a;border-radius:14px;overflow:hidden}
+  .pad{padding:18px}
+  h1{margin:0 0 6px;font-size:22px;font-weight:900}
+  .muted{color:#94a3b8}
+  label{display:block;margin-top:12px;font-weight:700}
+  input{width:100%;padding:11px;border-radius:10px;border:1px solid #1f294a;background:#0c1430;color:#e5e7eb}
+  button{width:100%;padding:12px;margin-top:14px;border-radius:10px;background:#22d3ee;color:#031519;font-weight:800;border:0;cursor:pointer}
+  a{color:#22d3ee;text-decoration:none}
+</style></head>
+<body>
+  <div class="wrap">
+    <div class="card"><div class="pad">
+      <h1>Cynthia Health Institute</h1>
+      <div class="muted">Authorized access for staff and administrators</div>
+      <form method="post" action="/login">
+        <label>Email</label>
+        <input name="email" type="email" placeholder="admin@example.com" required />
+        <label>Password</label>
+        <input name="password" type="password" placeholder="••••••••" required />
+        <button type="submit">Sign In</button>
+      </form>
+      <div class="muted" style="margin-top:12px">Having trouble? Contact the site owner.</div>
+    </div></div>
+  </div>
+</body></html>"""
+
+@app.get("/login")
+def login_page():
+    return Response(LOGIN_HTML, mimetype="text/html")
+
+# Receive credentials, set secure cookie containing ADMIN_TOKEN, then redirect to /console
+@app.post("/login")
+def login_post():
+    email = request.form.get("email","").strip()
+    password = request.form.get("password","")
+    ADMIN_USER = os.getenv("ADMIN_USER","")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD","")
+    if email == ADMIN_USER and password == ADMIN_PASSWORD and ADMIN_TOKEN:
+        resp = redirect("/console")
+        resp.set_cookie(
+            "auth", ADMIN_TOKEN,
+            max_age=7*24*3600, httponly=True, secure=True, samesite="Lax"
+        )
+        return resp
+    return Response("Invalid credentials", status=401)
+
+@app.get("/logout")
+def logout():
+    resp = redirect("/site")
+    resp.delete_cookie("auth")
+    return resp
+# ====== END LOGIN + COOKIE AUTH BRIDGE ======
